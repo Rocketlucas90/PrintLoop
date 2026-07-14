@@ -1,0 +1,348 @@
+# Print Farm Management Software — Design Doc
+### Bambu Lab Fleet Edition
+
+## 1. Scope & Assumptions
+
+This is a management layer for a farm of Bambu Lab printers (X1C/X1E, P1P/P1S, A1/A1 mini, H2D), covering:
+
+- Job intake, slicing hand-off, and queue scheduling across many printers
+- Real-time fleet monitoring (status, progress, temps, cam feed, errors)
+- Filament/AMS inventory and consumption tracking
+- Maintenance scheduling and failure/alerting
+- Multi-user roles (operators, techs, admins, customers if it's a print-on-demand shop)
+- Analytics: utilization, OEE, cost-per-print, failure rates
+
+**Printer connectivity strategy (see caveat above):** the system talks to printers through a **Printer Adapter** interface with two concrete implementations at launch, so we're not locked into a single, fragile integration:
+
+1. `LocalMQTTAdapter` — Developer Mode / LAN-only, per-printer MQTT+FTP (default, ships day one)
+2. `BambuLocalServerAdapter` — wraps the official Bambu Local Server SDK once approved, for batch discovery/control at scale
+
+A `CloudAPIAdapter` slot exists in the interface but is left unimplemented/behind a feature flag — swap it in later only if you get official access, given the ToS risk of unofficial cloud API libraries for a commercial product.
+
+---
+
+## 2. High-Level Architecture
+
+```
+                         ┌────────────────────────┐
+                         │        Web/App UI       │  (Farm dashboard, queue, analytics)
+                         └───────────┬─────────────┘
+                                     │ REST/GraphQL + WebSocket
+                         ┌───────────▼─────────────┐
+                         │      API Gateway         │  (Auth, RBAC, rate limit)
+                         └───────────┬─────────────┘
+              ┌──────────────────────┼──────────────────────┐
+   ┌──────────▼─────────┐ ┌──────────▼─────────┐  ┌──────────▼─────────┐
+   │  Job/Queue Service  │ │  Fleet Service      │  │  Inventory Service │
+   │  - scheduling        │ │  - printer state     │  │  - filament/AMS    │
+   │  - slicer hand-off    │ │  - telemetry ingest  │  │  - spool tracking  │
+   │  - priority/SLA       │ │  - alerts            │  │  - reorder rules   │
+   └──────────┬─────────┘ └──────────┬─────────┘  └──────────┬─────────┘
+              │                       │                         │
+              └─────────────┬────────┴─────────────┬───────────┘
+                             │  Event Bus (MQTT-internal / NATS / Redis Streams)
+                    ┌────────▼─────────┐
+                    │ Printer Adapter   │  interface: connect/status/start/pause/
+                    │ Layer             │  cancel/upload/ams/camera
+                    └────────┬──────────┘
+           ┌──────────────────┼───────────────────┐
+┌──────────▼─────────┐ ┌──────▼───────────┐ ┌──────▼───────────────┐
+│ LocalMQTTAdapter     │ │ BambuLocalServer  │ │ CloudAPIAdapter        │
+│ (Dev Mode, per-      │ │ Adapter (Docker   │ │ (feature-flagged,      │
+│  printer LAN/MQTT)   │ │  SDK, batch mgmt) │ │  official access only) │
+└──────────┬─────────┘ └──────┬───────────┘ └────────────────────────┘
+           │                    │
+     ┌─────▼──────┐      ┌──────▼──────┐
+     │  Printer 1  │ ...  │  Printer N   │   (X1C / P1S / A1 / H2D on farm LAN)
+     └────────────┘      └─────────────┘
+
+Persistence: PostgreSQL (relational: jobs, printers, spools, users)
+            + TimescaleDB/InfluxDB (telemetry time-series: temps, progress, errors)
+            + Object storage (S3/MinIO) for 3MF/gcode files, camera snapshots
+```
+
+---
+
+## 3. Core Data Model
+
+```
+Farm
+ ├─ id, name, location, timezone
+
+Printer
+ ├─ id, farm_id, serial, model (X1C/P1S/A1/H2D), name
+ ├─ ip_address, access_code (encrypted), lan_mode (bool)
+ ├─ adapter_type (local_mqtt | local_server | cloud)
+ ├─ status (idle | printing | paused | error | offline | maintenance)
+ ├─ current_job_id (nullable)
+ ├─ ams_units[] → AMSUnit
+ ├─ last_seen_at, firmware_version
+
+AMSUnit
+ ├─ id, printer_id, slot_index (0-3)
+ ├─ slots[4] → each: filament_type, color, remaining_pct, spool_id (nullable)
+
+FilamentSpool
+ ├─ id, material (PLA/PETG/ABS/ASA/TPU/PA/PC…), color, brand
+ ├─ initial_weight_g, remaining_weight_g, cost_per_kg
+ ├─ rfid_tag (if Bambu spool), purchased_at, location (shelf/bin)
+
+Job
+ ├─ id, farm_id, name, source_file_id (3mf/gcode in object storage)
+ ├─ status (queued | slicing | ready | assigned | printing | paused |
+ │           completed | failed | canceled)
+ ├─ priority, requested_by (user_id), customer_id (nullable, for POD shops)
+ ├─ material_required, color_required, estimated_time_min, estimated_weight_g
+ ├─ assigned_printer_id (nullable), queue_position
+ ├─ created_at, started_at, completed_at
+ ├─ print_settings (layer_height, infill, supports, plate_type)
+
+PrintAttempt
+ ├─ id, job_id, printer_id, started_at, ended_at
+ ├─ outcome (success | failed | canceled), failure_reason
+ ├─ actual_weight_used_g, actual_duration_min
+ ├─ telemetry_ref (pointer into time-series store)
+
+MaintenanceLog
+ ├─ id, printer_id, type (nozzle_change | belt_tension | ams_clean | calibration…)
+ ├─ performed_at, performed_by, notes, next_due_at
+
+Alert
+ ├─ id, printer_id/job_id, severity (info|warn|critical)
+ ├─ type (spaghetti_detected | ams_empty | offline | thermal_runaway | plate_full…)
+ ├─ created_at, acknowledged_by, resolved_at
+
+User
+ ├─ id, farm_id, role (admin | operator | technician | viewer | customer)
+```
+
+---
+
+## 4. Core Features
+
+**Job intake & queue**
+- Upload 3MF/STL → auto-slice via Bambu Studio CLI (headless) or accept pre-sliced 3MF
+- Auto-match job requirements (material, color, plate size, AMS availability) to eligible printers
+- Priority queue with SLA/due-date weighting; manual override/drag-and-drop reorder
+- Batch/repeat jobs (e.g., "print 50 of this part," auto-splits across idle printers)
+
+**Fleet dashboard**
+- Live grid view: status, progress %, ETA, nozzle/bed temp, current layer, camera thumbnail
+- Drill-in: full telemetry graph, live MJPEG/RTSP feed, remaining filament per AMS slot
+- Bulk actions: pause/resume/cancel across selected printers
+
+**Filament & AMS management**
+- Spool inventory with weight tracking (manual entry or scale integration), auto-decrement on job completion using `actual_weight_used_g`
+- Low-stock and reorder alerts per material/color
+- AMS slot mapping so the scheduler knows what's loaded where before assigning jobs
+
+**Maintenance**
+- Per-printer maintenance schedule (e.g., nozzle every 200 print-hours, AMS clutch check every N spool changes)
+- Auto-generated tickets when thresholds hit; logs feed into printer "health score"
+
+**Alerting**
+- Push/email/Slack/webhook on: print failure, spaghetti/AI-error detection, AMS runout, printer offline > N min, thermal anomaly
+- Escalation rules per severity
+
+**Analytics**
+- OEE-style metrics: utilization %, availability, first-pass yield
+- Cost per print (material + amortized machine time + labor)
+- Failure-rate by printer / material / operator / time-of-day
+- Farm capacity planning ("can we hit this order by Friday?")
+
+**Access control**
+- RBAC: admins manage fleet/users, operators run queue, technicians log maintenance, customers (optional POD mode) submit/track their own jobs only
+
+---
+
+## 5. Printer Adapter Interface (abstraction layer)
+
+This is the piece that insulates the rest of the app from Bambu's shifting integration story. Every adapter implements the same contract; the Fleet Service doesn't know or care which one is in use.
+
+```python
+# adapters/base.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional, Callable
+
+@dataclass
+class PrinterStatus:
+    printer_id: str
+    state: str              # idle|printing|paused|error|offline
+    progress_pct: float
+    layer_current: int
+    layer_total: int
+    nozzle_temp: float
+    bed_temp: float
+    eta_minutes: Optional[int]
+    ams_slots: list         # [{slot, material, color, remaining_pct}]
+    error_code: Optional[str]
+
+class PrinterAdapter(ABC):
+    """Contract every Bambu integration path must satisfy."""
+
+    @abstractmethod
+    def connect(self, printer) -> None: ...
+
+    @abstractmethod
+    def disconnect(self, printer_id: str) -> None: ...
+
+    @abstractmethod
+    def get_status(self, printer_id: str) -> PrinterStatus: ...
+
+    @abstractmethod
+    def subscribe_status(self, printer_id: str, callback: Callable[[PrinterStatus], None]) -> None:
+        """Push updates (MQTT topic or SDK event stream) into the internal event bus."""
+        ...
+
+    @abstractmethod
+    def upload_file(self, printer_id: str, file_path: str) -> str: ...
+
+    @abstractmethod
+    def start_print(self, printer_id: str, file_ref: str, plate_index: int = 1) -> None: ...
+
+    @abstractmethod
+    def pause_print(self, printer_id: str) -> None: ...
+
+    @abstractmethod
+    def resume_print(self, printer_id: str) -> None: ...
+
+    @abstractmethod
+    def cancel_print(self, printer_id: str) -> None: ...
+
+    @abstractmethod
+    def get_camera_stream_url(self, printer_id: str) -> Optional[str]: ...
+```
+
+```python
+# adapters/local_mqtt.py
+# Default, ships day one. Built on the same pattern as the open-source
+# `bambulabs_api` package: Developer Mode, per-printer IP + serial + access code,
+# MQTT for telemetry/commands, FTP for file upload, no cloud dependency.
+
+import paho.mqtt.client as mqtt
+from .base import PrinterAdapter, PrinterStatus
+
+class LocalMQTTAdapter(PrinterAdapter):
+    def __init__(self):
+        self._clients: dict[str, mqtt.Client] = {}
+        self._callbacks: dict[str, callable] = {}
+
+    def connect(self, printer):
+        client = mqtt.Client(client_id=f"farm-{printer.id}", protocol=mqtt.MQTTv311)
+        client.username_pw_set("bblp", printer.access_code)
+        client.tls_set()  # Bambu local MQTT uses TLS on 8883
+        client.on_message = self._on_message(printer.id)
+        client.connect(printer.ip_address, 8883, keepalive=30)
+        client.subscribe(f"device/{printer.serial}/report")
+        client.loop_start()
+        self._clients[printer.id] = client
+
+    def _on_message(self, printer_id):
+        def handler(client, userdata, msg):
+            status = self._parse_report(printer_id, msg.payload)
+            cb = self._callbacks.get(printer_id)
+            if cb:
+                cb(status)
+        return handler
+
+    def _parse_report(self, printer_id, payload) -> PrinterStatus:
+        # Parse Bambu's `print` JSON report schema (gcode_state, mc_percent,
+        # layer_num, nozzle_temper, bed_temper, ams[], print_error, etc.)
+        ...
+
+    def subscribe_status(self, printer_id, callback):
+        self._callbacks[printer_id] = callback
+
+    def start_print(self, printer_id, file_ref, plate_index=1):
+        client = self._clients[printer_id]
+        payload = {
+            "print": {
+                "sequence_id": "0",
+                "command": "project_file",
+                "param": f"Metadata/plate_{plate_index}.gcode",
+                "url": f"ftp://{file_ref}",
+            }
+        }
+        client.publish("device/.../request", json_dumps(payload))
+
+    # upload_file() uses FTPS to the printer's local FTP server (port 990)
+    # pause/resume/cancel publish the corresponding `print.command` payloads
+    # get_camera_stream_url() returns rtsps:// for X1 series, or sets up
+    #   a local JPEG-pull loop for A1/P1 series (no native RTSP on those)
+```
+
+```python
+# adapters/bambu_local_server.py
+# Used once you have the official SDK. Wraps the vendor's local REST/gRPC
+# server (deployed as a Docker container on your farm network) which handles
+# discovery, batch control, and file distribution across many printers at once —
+# built specifically for ERP/MES-style integration.
+
+class BambuLocalServerAdapter(PrinterAdapter):
+    def __init__(self, server_base_url: str, api_key: str):
+        ...
+    # Implementation calls the Local Server's discovery/bind/batch-control/
+    # file-upload endpoints per the vendor SDK docs issued after approval.
+```
+
+The **Fleet Service** picks an adapter per-printer based on `printer.adapter_type`, so a single farm can mix Developer-Mode printers and Local-Server-managed printers during a phased rollout.
+
+---
+
+## 6. Job Lifecycle (state machine)
+
+```
+queued → slicing → ready → assigned → printing ─┬→ completed
+                                        │          └→ failed → (requeued | closed)
+                                        └→ paused → printing
+                                        └→ canceled
+```
+
+- **Scheduler tick** (every few seconds): finds `ready` jobs, matches against idle printers with compatible AMS-loaded material/color, assigns highest priority first, respects any pinned "customer wants printer X" overrides.
+- **Failure detection**: adapter reports `print_error` or AI spaghetti-detection flag → job → `failed`, alert fired, printer auto-paused, technician can requeue or close.
+- **Completion**: adapter reports 100%/idle → job → `completed`, `actual_weight_used_g` pulled from AMS delta, spool inventory decremented, printer becomes available for next queued job.
+
+---
+
+## 7. Tech Stack Recommendation
+
+| Layer | Choice | Why |
+|---|---|---|
+| Backend API | Python (FastAPI) or Node (NestJS) | Both have solid MQTT + async support; FastAPI pairs naturally with `bambulabs_api`-style Python adapters |
+| Real-time transport | WebSocket (to UI) + internal MQTT broker (Mosquitto) or Redis Streams | Printer MQTT feeds map cleanly onto an internal pub/sub bus |
+| DB | PostgreSQL | Relational job/printer/inventory data, mature, easy RBAC |
+| Time-series | TimescaleDB (Postgres extension) | Telemetry history without a second DB engine |
+| Object storage | S3-compatible (AWS S3 or self-hosted MinIO) | 3MF/gcode files, camera snapshots |
+| Frontend | React + Vite, WebSocket live updates, Tailwind | Standard, fast dashboard build |
+| Slicing automation | Bambu Studio CLI (headless mode) in a worker container | Auto-slice uploaded STL/3MF without manual Studio use |
+| Deployment | Self-hosted on a box on the same LAN as the printers (or a farm-local edge node + cloud dashboard relay) | Local MQTT/Local Server both require LAN proximity to printers; don't assume a pure-cloud deployment |
+
+---
+
+## 8. Deployment Topology
+
+Because both viable integration paths are LAN-bound, the practical architecture is an **edge + cloud split**:
+
+- **Edge node** (small box/NUC/Raspberry Pi on the farm's local network): runs the Printer Adapter Layer, ingests MQTT/telemetry, buffers commands, talks to printers directly.
+- **Cloud/back-office** (or a second local server if you want zero cloud dependency): runs the Job/Queue/Inventory/Analytics services, the dashboard, and user auth. Edge node syncs telemetry up and receives job assignments down over a secure tunnel (WireGuard/Tailscale is a common, low-friction choice for this).
+- Multi-site farms: one edge node per physical location, one shared back-office.
+
+---
+
+## 9. Suggested Build Phases
+
+1. **MVP**: single-farm, `LocalMQTTAdapter` only, manual job upload, live status grid, basic filament tracking, no scheduler (manual assignment)
+2. **V1**: auto-scheduler with material/color matching, alerting, maintenance logs, analytics dashboard
+3. **V2**: multi-site/edge-node architecture, RBAC with customer-facing portal (if running print-on-demand), batch job splitting
+4. **V3**: swap in `BambuLocalServerAdapter` if/when SDK access is granted, for larger-scale batch control
+
+---
+
+## 10. Open Questions to Nail Down Before Building
+
+- Farm size and printer models (X1 vs P1 vs A1 changes camera/AMS capabilities materially)
+- Single site or multi-site?
+- Internal use only, or customer-facing print-on-demand storefront?
+- Auto-slicing needed, or will operators always hand-slice in Bambu Studio and just upload 3MF?
+- Appetite for applying to Bambu's official SDK program (adds lead time but removes the LAN/adapter juggling long-term)
