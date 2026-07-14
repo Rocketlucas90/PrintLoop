@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Untitled Document.md</title>
+  
+</head>
+<body id="preview">
+<h1 class="code-line has-line-data" data-line-start="0" data-line-end="1"><a id="Print_Farm_Management_Software_Design_Doc_0"></a>Print Farm Management Software — Design Doc</h1>
+<h3 class="code-line has-line-data" data-line-start="1" data-line-end="2"><a id="Bambu_Lab_Fleet_Edition_1"></a>Bambu Lab Fleet Edition</h3>
+<h2 class="code-line has-line-data" data-line-start="3" data-line-end="4"><a id="1_Scope_Assumptions_3"></a>1. Scope &amp; Assumptions</h2>
+<p class="has-line-data" data-line-start="5" data-line-end="6">This is a management layer for a farm of Bambu Lab printers (X1C/X1E, P1P/P1S, A1/A1 mini, H2D), covering:</p>
+<ul>
+<li class="has-line-data" data-line-start="7" data-line-end="8">Job intake, slicing hand-off, and queue scheduling across many printers</li>
+<li class="has-line-data" data-line-start="8" data-line-end="9">Real-time fleet monitoring (status, progress, temps, cam feed, errors)</li>
+<li class="has-line-data" data-line-start="9" data-line-end="10">Filament/AMS inventory and consumption tracking</li>
+<li class="has-line-data" data-line-start="10" data-line-end="11">Maintenance scheduling and failure/alerting</li>
+<li class="has-line-data" data-line-start="11" data-line-end="12">Multi-user roles (operators, techs, admins, customers if it’s a print-on-demand shop)</li>
+<li class="has-line-data" data-line-start="12" data-line-end="14">Analytics: utilization, OEE, cost-per-print, failure rates</li>
+</ul>
+<p class="has-line-data" data-line-start="14" data-line-end="15"><strong>Printer connectivity strategy (see caveat above):</strong> the system talks to printers through a <strong>Printer Adapter</strong> interface with two concrete implementations at launch, so we’re not locked into a single, fragile integration:</p>
+<ol>
+<li class="has-line-data" data-line-start="16" data-line-end="17"><code>LocalMQTTAdapter</code> — Developer Mode / LAN-only, per-printer MQTT+FTP (default, ships day one)</li>
+<li class="has-line-data" data-line-start="17" data-line-end="19"><code>BambuLocalServerAdapter</code> — wraps the official Bambu Local Server SDK once approved, for batch discovery/control at scale</li>
+</ol>
+<p class="has-line-data" data-line-start="19" data-line-end="20">A <code>CloudAPIAdapter</code> slot exists in the interface but is left unimplemented/behind a feature flag — swap it in later only if you get official access, given the ToS risk of unofficial cloud API libraries for a commercial product.</p>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="23" data-line-end="24"><a id="2_HighLevel_Architecture_23"></a>2. High-Level Architecture</h2>
+<pre><code class="has-line-data" data-line-start="26" data-line-end="62">                         ┌────────────────────────┐
+                         │        Web/App UI       │  (Farm dashboard, queue, analytics)
+                         └───────────┬─────────────┘
+                                     │ REST/GraphQL + WebSocket
+                         ┌───────────▼─────────────┐
+                         │      API Gateway         │  (Auth, RBAC, rate limit)
+                         └───────────┬─────────────┘
+              ┌──────────────────────┼──────────────────────┐
+   ┌──────────▼─────────┐ ┌──────────▼─────────┐  ┌──────────▼─────────┐
+   │  Job/Queue Service  │ │  Fleet Service      │  │  Inventory Service │
+   │  - scheduling        │ │  - printer state     │  │  - filament/AMS    │
+   │  - slicer hand-off    │ │  - telemetry ingest  │  │  - spool tracking  │
+   │  - priority/SLA       │ │  - alerts            │  │  - reorder rules   │
+   └──────────┬─────────┘ └──────────┬─────────┘  └──────────┬─────────┘
+              │                       │                         │
+              └─────────────┬────────┴─────────────┬───────────┘
+                             │  Event Bus (MQTT-internal / NATS / Redis Streams)
+                    ┌────────▼─────────┐
+                    │ Printer Adapter   │  interface: connect/status/start/pause/
+                    │ Layer             │  cancel/upload/ams/camera
+                    └────────┬──────────┘
+           ┌──────────────────┼───────────────────┐
+┌──────────▼─────────┐ ┌──────▼───────────┐ ┌──────▼───────────────┐
+│ LocalMQTTAdapter     │ │ BambuLocalServer  │ │ CloudAPIAdapter        │
+│ (Dev Mode, per-      │ │ Adapter (Docker   │ │ (feature-flagged,      │
+│  printer LAN/MQTT)   │ │  SDK, batch mgmt) │ │  official access only) │
+└──────────┬─────────┘ └──────┬───────────┘ └────────────────────────┘
+           │                    │
+     ┌─────▼──────┐      ┌──────▼──────┐
+     │  Printer 1  │ ...  │  Printer N   │   (X1C / P1S / A1 / H2D on farm LAN)
+     └────────────┘      └─────────────┘
+
+Persistence: PostgreSQL (relational: jobs, printers, spools, users)
+            + TimescaleDB/InfluxDB (telemetry time-series: temps, progress, errors)
+            + Object storage (S3/MinIO) for 3MF/gcode files, camera snapshots
+</code></pre>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="65" data-line-end="66"><a id="3_Core_Data_Model_65"></a>3. Core Data Model</h2>
+<pre><code class="has-line-data" data-line-start="68" data-line-end="117">Farm
+ ├─ id, name, location, timezone
+
+Printer
+ ├─ id, farm_id, serial, model (X1C/P1S/A1/H2D), name
+ ├─ ip_address, access_code (encrypted), lan_mode (bool)
+ ├─ adapter_type (local_mqtt | local_server | cloud)
+ ├─ status (idle | printing | paused | error | offline | maintenance)
+ ├─ current_job_id (nullable)
+ ├─ ams_units[] → AMSUnit
+ ├─ last_seen_at, firmware_version
+
+AMSUnit
+ ├─ id, printer_id, slot_index (0-3)
+ ├─ slots[4] → each: filament_type, color, remaining_pct, spool_id (nullable)
+
+FilamentSpool
+ ├─ id, material (PLA/PETG/ABS/ASA/TPU/PA/PC…), color, brand
+ ├─ initial_weight_g, remaining_weight_g, cost_per_kg
+ ├─ rfid_tag (if Bambu spool), purchased_at, location (shelf/bin)
+
+Job
+ ├─ id, farm_id, name, source_file_id (3mf/gcode in object storage)
+ ├─ status (queued | slicing | ready | assigned | printing | paused |
+ │           completed | failed | canceled)
+ ├─ priority, requested_by (user_id), customer_id (nullable, for POD shops)
+ ├─ material_required, color_required, estimated_time_min, estimated_weight_g
+ ├─ assigned_printer_id (nullable), queue_position
+ ├─ created_at, started_at, completed_at
+ ├─ print_settings (layer_height, infill, supports, plate_type)
+
+PrintAttempt
+ ├─ id, job_id, printer_id, started_at, ended_at
+ ├─ outcome (success | failed | canceled), failure_reason
+ ├─ actual_weight_used_g, actual_duration_min
+ ├─ telemetry_ref (pointer into time-series store)
+
+MaintenanceLog
+ ├─ id, printer_id, type (nozzle_change | belt_tension | ams_clean | calibration…)
+ ├─ performed_at, performed_by, notes, next_due_at
+
+Alert
+ ├─ id, printer_id/job_id, severity (info|warn|critical)
+ ├─ type (spaghetti_detected | ams_empty | offline | thermal_runaway | plate_full…)
+ ├─ created_at, acknowledged_by, resolved_at
+
+User
+ ├─ id, farm_id, role (admin | operator | technician | viewer | customer)
+</code></pre>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="120" data-line-end="121"><a id="4_Core_Features_120"></a>4. Core Features</h2>
+<p class="has-line-data" data-line-start="122" data-line-end="123"><strong>Job intake &amp; queue</strong></p>
+<ul>
+<li class="has-line-data" data-line-start="123" data-line-end="124">Upload 3MF/STL → auto-slice via Bambu Studio CLI (headless) or accept pre-sliced 3MF</li>
+<li class="has-line-data" data-line-start="124" data-line-end="125">Auto-match job requirements (material, color, plate size, AMS availability) to eligible printers</li>
+<li class="has-line-data" data-line-start="125" data-line-end="126">Priority queue with SLA/due-date weighting; manual override/drag-and-drop reorder</li>
+<li class="has-line-data" data-line-start="126" data-line-end="128">Batch/repeat jobs (e.g., “print 50 of this part,” auto-splits across idle printers)</li>
+</ul>
+<p class="has-line-data" data-line-start="128" data-line-end="129"><strong>Fleet dashboard</strong></p>
+<ul>
+<li class="has-line-data" data-line-start="129" data-line-end="130">Live grid view: status, progress %, ETA, nozzle/bed temp, current layer, camera thumbnail</li>
+<li class="has-line-data" data-line-start="130" data-line-end="131">Drill-in: full telemetry graph, live MJPEG/RTSP feed, remaining filament per AMS slot</li>
+<li class="has-line-data" data-line-start="131" data-line-end="133">Bulk actions: pause/resume/cancel across selected printers</li>
+</ul>
+<p class="has-line-data" data-line-start="133" data-line-end="134"><strong>Filament &amp; AMS management</strong></p>
+<ul>
+<li class="has-line-data" data-line-start="134" data-line-end="135">Spool inventory with weight tracking (manual entry or scale integration), auto-decrement on job completion using <code>actual_weight_used_g</code></li>
+<li class="has-line-data" data-line-start="135" data-line-end="136">Low-stock and reorder alerts per material/color</li>
+<li class="has-line-data" data-line-start="136" data-line-end="138">AMS slot mapping so the scheduler knows what’s loaded where before assigning jobs</li>
+</ul>
+<p class="has-line-data" data-line-start="138" data-line-end="139"><strong>Maintenance</strong></p>
+<ul>
+<li class="has-line-data" data-line-start="139" data-line-end="140">Per-printer maintenance schedule (e.g., nozzle every 200 print-hours, AMS clutch check every N spool changes)</li>
+<li class="has-line-data" data-line-start="140" data-line-end="142">Auto-generated tickets when thresholds hit; logs feed into printer “health score”</li>
+</ul>
+<p class="has-line-data" data-line-start="142" data-line-end="143"><strong>Alerting</strong></p>
+<ul>
+<li class="has-line-data" data-line-start="143" data-line-end="144">Push/email/Slack/webhook on: print failure, spaghetti/AI-error detection, AMS runout, printer offline &gt; N min, thermal anomaly</li>
+<li class="has-line-data" data-line-start="144" data-line-end="146">Escalation rules per severity</li>
+</ul>
+<p class="has-line-data" data-line-start="146" data-line-end="147"><strong>Analytics</strong></p>
+<ul>
+<li class="has-line-data" data-line-start="147" data-line-end="148">OEE-style metrics: utilization %, availability, first-pass yield</li>
+<li class="has-line-data" data-line-start="148" data-line-end="149">Cost per print (material + amortized machine time + labor)</li>
+<li class="has-line-data" data-line-start="149" data-line-end="150">Failure-rate by printer / material / operator / time-of-day</li>
+<li class="has-line-data" data-line-start="150" data-line-end="152">Farm capacity planning (“can we hit this order by Friday?”)</li>
+</ul>
+<p class="has-line-data" data-line-start="152" data-line-end="153"><strong>Access control</strong></p>
+<ul>
+<li class="has-line-data" data-line-start="153" data-line-end="155">RBAC: admins manage fleet/users, operators run queue, technicians log maintenance, customers (optional POD mode) submit/track their own jobs only</li>
+</ul>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="157" data-line-end="158"><a id="5_Printer_Adapter_Interface_abstraction_layer_157"></a>5. Printer Adapter Interface (abstraction layer)</h2>
+<p class="has-line-data" data-line-start="159" data-line-end="160">This is the piece that insulates the rest of the app from Bambu’s shifting integration story. Every adapter implements the same contract; the Fleet Service doesn’t know or care which one is in use.</p>
+<pre><code class="has-line-data language-python" data-line-start="162" data-line-end="215"><span class="hljs-comment"># adapters/base.py</span>
+<span class="hljs-keyword">from</span> abc <span class="hljs-keyword">import</span> ABC, abstractmethod
+<span class="hljs-keyword">from</span> dataclasses <span class="hljs-keyword">import</span> dataclass
+<span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">Optional</span>, <span class="hljs-type">Callable</span>
+
+<span class="hljs-meta">@dataclass</span>
+<span class="hljs-keyword">class</span> <span class="hljs-title class_">PrinterStatus</span>:
+    printer_id: <span class="hljs-built_in">str</span>
+    state: <span class="hljs-built_in">str</span>              <span class="hljs-comment"># idle|printing|paused|error|offline</span>
+    progress_pct: <span class="hljs-built_in">float</span>
+    layer_current: <span class="hljs-built_in">int</span>
+    layer_total: <span class="hljs-built_in">int</span>
+    nozzle_temp: <span class="hljs-built_in">float</span>
+    bed_temp: <span class="hljs-built_in">float</span>
+    eta_minutes: <span class="hljs-type">Optional</span>[<span class="hljs-built_in">int</span>]
+    ams_slots: <span class="hljs-built_in">list</span>         <span class="hljs-comment"># [{slot, material, color, remaining_pct}]</span>
+    error_code: <span class="hljs-type">Optional</span>[<span class="hljs-built_in">str</span>]
+
+<span class="hljs-keyword">class</span> <span class="hljs-title class_">PrinterAdapter</span>(<span class="hljs-title class_ inherited__">ABC</span>):
+    <span class="hljs-string">&quot;&quot;&quot;Contract every Bambu integration path must satisfy.&quot;&quot;&quot;</span>
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">connect</span>(<span class="hljs-params">self, printer</span>) -&gt; <span class="hljs-literal">None</span>: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">disconnect</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-literal">None</span>: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">get_status</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span></span>) -&gt; PrinterStatus: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">subscribe_status</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span>, callback: <span class="hljs-type">Callable</span>[[PrinterStatus], <span class="hljs-literal">None</span>]</span>) -&gt; <span class="hljs-literal">None</span>:
+        <span class="hljs-string">&quot;&quot;&quot;Push updates (MQTT topic or SDK event stream) into the internal event bus.&quot;&quot;&quot;</span>
+        ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">upload_file</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span>, file_path: <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-built_in">str</span>: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">start_print</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span>, file_ref: <span class="hljs-built_in">str</span>, plate_index: <span class="hljs-built_in">int</span> = <span class="hljs-number">1</span></span>) -&gt; <span class="hljs-literal">None</span>: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">pause_print</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-literal">None</span>: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">resume_print</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-literal">None</span>: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">cancel_print</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-literal">None</span>: ...
+
+<span class="hljs-meta">    @abstractmethod</span>
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">get_camera_stream_url</span>(<span class="hljs-params">self, printer_id: <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-type">Optional</span>[<span class="hljs-built_in">str</span>]: ...
+</code></pre>
+<pre><code class="has-line-data language-python" data-line-start="217" data-line-end="273"><span class="hljs-comment"># adapters/local_mqtt.py</span>
+<span class="hljs-comment"># Default, ships day one. Built on the same pattern as the open-source</span>
+<span class="hljs-comment"># `bambulabs_api` package: Developer Mode, per-printer IP + serial + access code,</span>
+<span class="hljs-comment"># MQTT for telemetry/commands, FTP for file upload, no cloud dependency.</span>
+
+<span class="hljs-keyword">import</span> paho.mqtt.client <span class="hljs-keyword">as</span> mqtt
+<span class="hljs-keyword">from</span> .base <span class="hljs-keyword">import</span> PrinterAdapter, PrinterStatus
+
+<span class="hljs-keyword">class</span> <span class="hljs-title class_">LocalMQTTAdapter</span>(<span class="hljs-title class_ inherited__">PrinterAdapter</span>):
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">__init__</span>(<span class="hljs-params">self</span>):
+        <span class="hljs-variable language_">self</span>._clients: <span class="hljs-built_in">dict</span>[<span class="hljs-built_in">str</span>, mqtt.Client] = {}
+        <span class="hljs-variable language_">self</span>._callbacks: <span class="hljs-built_in">dict</span>[<span class="hljs-built_in">str</span>, <span class="hljs-built_in">callable</span>] = {}
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">connect</span>(<span class="hljs-params">self, printer</span>):
+        client = mqtt.Client(client_id=<span class="hljs-string">f&quot;farm-<span class="hljs-subst">{printer.<span class="hljs-built_in">id</span>}</span>&quot;</span>, protocol=mqtt.MQTTv311)
+        client.username_pw_set(<span class="hljs-string">&quot;bblp&quot;</span>, printer.access_code)
+        client.tls_set()  <span class="hljs-comment"># Bambu local MQTT uses TLS on 8883</span>
+        client.on_message = <span class="hljs-variable language_">self</span>._on_message(printer.<span class="hljs-built_in">id</span>)
+        client.connect(printer.ip_address, <span class="hljs-number">8883</span>, keepalive=<span class="hljs-number">30</span>)
+        client.subscribe(<span class="hljs-string">f&quot;device/<span class="hljs-subst">{printer.serial}</span>/report&quot;</span>)
+        client.loop_start()
+        <span class="hljs-variable language_">self</span>._clients[printer.<span class="hljs-built_in">id</span>] = client
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">_on_message</span>(<span class="hljs-params">self, printer_id</span>):
+        <span class="hljs-keyword">def</span> <span class="hljs-title function_">handler</span>(<span class="hljs-params">client, userdata, msg</span>):
+            status = <span class="hljs-variable language_">self</span>._parse_report(printer_id, msg.payload)
+            cb = <span class="hljs-variable language_">self</span>._callbacks.get(printer_id)
+            <span class="hljs-keyword">if</span> cb:
+                cb(status)
+        <span class="hljs-keyword">return</span> handler
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">_parse_report</span>(<span class="hljs-params">self, printer_id, payload</span>) -&gt; PrinterStatus:
+        <span class="hljs-comment"># Parse Bambu&#x27;s `print` JSON report schema (gcode_state, mc_percent,</span>
+        <span class="hljs-comment"># layer_num, nozzle_temper, bed_temper, ams[], print_error, etc.)</span>
+        ...
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">subscribe_status</span>(<span class="hljs-params">self, printer_id, callback</span>):
+        <span class="hljs-variable language_">self</span>._callbacks[printer_id] = callback
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">start_print</span>(<span class="hljs-params">self, printer_id, file_ref, plate_index=<span class="hljs-number">1</span></span>):
+        client = <span class="hljs-variable language_">self</span>._clients[printer_id]
+        payload = {
+            <span class="hljs-string">&quot;print&quot;</span>: {
+                <span class="hljs-string">&quot;sequence_id&quot;</span>: <span class="hljs-string">&quot;0&quot;</span>,
+                <span class="hljs-string">&quot;command&quot;</span>: <span class="hljs-string">&quot;project_file&quot;</span>,
+                <span class="hljs-string">&quot;param&quot;</span>: <span class="hljs-string">f&quot;Metadata/plate_<span class="hljs-subst">{plate_index}</span>.gcode&quot;</span>,
+                <span class="hljs-string">&quot;url&quot;</span>: <span class="hljs-string">f&quot;ftp://<span class="hljs-subst">{file_ref}</span>&quot;</span>,
+            }
+        }
+        client.publish(<span class="hljs-string">&quot;device/.../request&quot;</span>, json_dumps(payload))
+
+    <span class="hljs-comment"># upload_file() uses FTPS to the printer&#x27;s local FTP server (port 990)</span>
+    <span class="hljs-comment"># pause/resume/cancel publish the corresponding `print.command` payloads</span>
+    <span class="hljs-comment"># get_camera_stream_url() returns rtsps:// for X1 series, or sets up</span>
+    <span class="hljs-comment">#   a local JPEG-pull loop for A1/P1 series (no native RTSP on those)</span>
+</code></pre>
+<pre><code class="has-line-data language-python" data-line-start="275" data-line-end="287"><span class="hljs-comment"># adapters/bambu_local_server.py</span>
+<span class="hljs-comment"># Used once you have the official SDK. Wraps the vendor&#x27;s local REST/gRPC</span>
+<span class="hljs-comment"># server (deployed as a Docker container on your farm network) which handles</span>
+<span class="hljs-comment"># discovery, batch control, and file distribution across many printers at once —</span>
+<span class="hljs-comment"># built specifically for ERP/MES-style integration.</span>
+
+<span class="hljs-keyword">class</span> <span class="hljs-title class_">BambuLocalServerAdapter</span>(<span class="hljs-title class_ inherited__">PrinterAdapter</span>):
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">__init__</span>(<span class="hljs-params">self, server_base_url: <span class="hljs-built_in">str</span>, api_key: <span class="hljs-built_in">str</span></span>):
+        ...
+    <span class="hljs-comment"># Implementation calls the Local Server&#x27;s discovery/bind/batch-control/</span>
+    <span class="hljs-comment"># file-upload endpoints per the vendor SDK docs issued after approval.</span>
+</code></pre>
+<p class="has-line-data" data-line-start="288" data-line-end="289">The <strong>Fleet Service</strong> picks an adapter per-printer based on <code>printer.adapter_type</code>, so a single farm can mix Developer-Mode printers and Local-Server-managed printers during a phased rollout.</p>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="292" data-line-end="293"><a id="6_Job_Lifecycle_state_machine_292"></a>6. Job Lifecycle (state machine)</h2>
+<pre><code class="has-line-data" data-line-start="295" data-line-end="300">queued → slicing → ready → assigned → printing ─┬→ completed
+                                        │          └→ failed → (requeued | closed)
+                                        └→ paused → printing
+                                        └→ canceled
+</code></pre>
+<ul>
+<li class="has-line-data" data-line-start="301" data-line-end="302"><strong>Scheduler tick</strong> (every few seconds): finds <code>ready</code> jobs, matches against idle printers with compatible AMS-loaded material/color, assigns highest priority first, respects any pinned “customer wants printer X” overrides.</li>
+<li class="has-line-data" data-line-start="302" data-line-end="303"><strong>Failure detection</strong>: adapter reports <code>print_error</code> or AI spaghetti-detection flag → job → <code>failed</code>, alert fired, printer auto-paused, technician can requeue or close.</li>
+<li class="has-line-data" data-line-start="303" data-line-end="305"><strong>Completion</strong>: adapter reports 100%/idle → job → <code>completed</code>, <code>actual_weight_used_g</code> pulled from AMS delta, spool inventory decremented, printer becomes available for next queued job.</li>
+</ul>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="307" data-line-end="308"><a id="7_Tech_Stack_Recommendation_307"></a>7. Tech Stack Recommendation</h2>
+<table class="table table-striped table-bordered">
+<thead>
+<tr>
+<th>Layer</th>
+<th>Choice</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backend API</td>
+<td>Python (FastAPI) or Node (NestJS)</td>
+<td>Both have solid MQTT + async support; FastAPI pairs naturally with <code>bambulabs_api</code>-style Python adapters</td>
+</tr>
+<tr>
+<td>Real-time transport</td>
+<td>WebSocket (to UI) + internal MQTT broker (Mosquitto) or Redis Streams</td>
+<td>Printer MQTT feeds map cleanly onto an internal pub/sub bus</td>
+</tr>
+<tr>
+<td>DB</td>
+<td>PostgreSQL</td>
+<td>Relational job/printer/inventory data, mature, easy RBAC</td>
+</tr>
+<tr>
+<td>Time-series</td>
+<td>TimescaleDB (Postgres extension)</td>
+<td>Telemetry history without a second DB engine</td>
+</tr>
+<tr>
+<td>Object storage</td>
+<td>S3-compatible (AWS S3 or self-hosted MinIO)</td>
+<td>3MF/gcode files, camera snapshots</td>
+</tr>
+<tr>
+<td>Frontend</td>
+<td>React + Vite, WebSocket live updates, Tailwind</td>
+<td>Standard, fast dashboard build</td>
+</tr>
+<tr>
+<td>Slicing automation</td>
+<td>Bambu Studio CLI (headless mode) in a worker container</td>
+<td>Auto-slice uploaded STL/3MF without manual Studio use</td>
+</tr>
+<tr>
+<td>Deployment</td>
+<td>Self-hosted on a box on the same LAN as the printers (or a farm-local edge node + cloud dashboard relay)</td>
+<td>Local MQTT/Local Server both require LAN proximity to printers; don’t assume a pure-cloud deployment</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="322" data-line-end="323"><a id="8_Deployment_Topology_322"></a>8. Deployment Topology</h2>
+<p class="has-line-data" data-line-start="324" data-line-end="325">Because both viable integration paths are LAN-bound, the practical architecture is an <strong>edge + cloud split</strong>:</p>
+<ul>
+<li class="has-line-data" data-line-start="326" data-line-end="327"><strong>Edge node</strong> (small box/NUC/Raspberry Pi on the farm’s local network): runs the Printer Adapter Layer, ingests MQTT/telemetry, buffers commands, talks to printers directly.</li>
+<li class="has-line-data" data-line-start="327" data-line-end="328"><strong>Cloud/back-office</strong> (or a second local server if you want zero cloud dependency): runs the Job/Queue/Inventory/Analytics services, the dashboard, and user auth. Edge node syncs telemetry up and receives job assignments down over a secure tunnel (WireGuard/Tailscale is a common, low-friction choice for this).</li>
+<li class="has-line-data" data-line-start="328" data-line-end="330">Multi-site farms: one edge node per physical location, one shared back-office.</li>
+</ul>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="332" data-line-end="333"><a id="9_Suggested_Build_Phases_332"></a>9. Suggested Build Phases</h2>
+<ol>
+<li class="has-line-data" data-line-start="334" data-line-end="335"><strong>MVP</strong>: single-farm, <code>LocalMQTTAdapter</code> only, manual job upload, live status grid, basic filament tracking, no scheduler (manual assignment)</li>
+<li class="has-line-data" data-line-start="335" data-line-end="336"><strong>V1</strong>: auto-scheduler with material/color matching, alerting, maintenance logs, analytics dashboard</li>
+<li class="has-line-data" data-line-start="336" data-line-end="337"><strong>V2</strong>: multi-site/edge-node architecture, RBAC with customer-facing portal (if running print-on-demand), batch job splitting</li>
+<li class="has-line-data" data-line-start="337" data-line-end="339"><strong>V3</strong>: swap in <code>BambuLocalServerAdapter</code> if/when SDK access is granted, for larger-scale batch control</li>
+</ol>
+<hr>
+<h2 class="code-line has-line-data" data-line-start="341" data-line-end="342"><a id="10_Open_Questions_to_Nail_Down_Before_Building_341"></a>10. Open Questions to Nail Down Before Building</h2>
+<ul>
+<li class="has-line-data" data-line-start="343" data-line-end="344">Farm size and printer models (X1 vs P1 vs A1 changes camera/AMS capabilities materially)</li>
+<li class="has-line-data" data-line-start="344" data-line-end="345">Single site or multi-site?</li>
+<li class="has-line-data" data-line-start="345" data-line-end="346">Internal use only, or customer-facing print-on-demand storefront?</li>
+<li class="has-line-data" data-line-start="346" data-line-end="347">Auto-slicing needed, or will operators always hand-slice in Bambu Studio and just upload 3MF?</li>
+<li class="has-line-data" data-line-start="347" data-line-end="348">Appetite for applying to Bambu’s official SDK program (adds lead time but removes the LAN/adapter juggling long-term)</li>
+</ul>
+
+</body>
+</html>
